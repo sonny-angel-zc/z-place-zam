@@ -1,4 +1,5 @@
 import { Redis } from "@upstash/redis";
+import { createClient } from "redis";
 import {
   ALLOWED_COLORS,
   BOARD_HEIGHT,
@@ -61,6 +62,8 @@ const REDIS_KEYS = {
 
 const ARTIFACT_NS = process.env.ZPLACE_ARTIFACT_NS || "zplace:prod";
 const ARTIFACT_NAME = process.env.ZPLACE_ARTIFACT_NAME || "board-state.json";
+type RedisUrlClient = ReturnType<typeof createClient>;
+let redisUrlClientPromise: Promise<RedisUrlClient | null> | null = null;
 
 function getRedisClient(): Redis | null {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -71,6 +74,20 @@ function getRedisClient(): Redis | null {
   }
 
   return new Redis({ url, token });
+}
+
+async function getRedisUrlClient(): Promise<RedisUrlClient | null> {
+  const url = process.env.REDIS_URL;
+  if (!url) {
+    return null;
+  }
+
+  if (!redisUrlClientPromise) {
+    const client = createClient({ url });
+    redisUrlClientPromise = client.connect().then(() => client);
+  }
+
+  return redisUrlClientPromise;
 }
 
 function getArtifactRunUrl(): string | null {
@@ -441,6 +458,21 @@ async function getStateFromRedis(redis: Redis): Promise<BoardStateResponse> {
   return toBoardState(pixels, parseMeta(metaRaw), recentAgents);
 }
 
+async function getStateFromRedisUrl(redis: RedisUrlClient): Promise<BoardStateResponse> {
+  const [pixelsRaw, recentAgentsRaw, metaRaw] = await Promise.all([
+    redis.hGetAll(REDIS_KEYS.pixels),
+    redis.lRange(REDIS_KEYS.recentAgents, 0, RECENT_AGENT_LIMIT - 1),
+    redis.hGetAll(REDIS_KEYS.meta)
+  ]);
+
+  const pixels: PixelTuple[] = Object.entries(pixelsRaw ?? {})
+    .map(([index, color]) => [Number(index), color as AllowedColor] as PixelTuple)
+    .sort((a, b) => a[0] - b[0]);
+
+  const recentAgents = (recentAgentsRaw ?? []).map((entry) => JSON.parse(entry) as PlacementRecord);
+  return toBoardState(pixels, parseMeta(metaRaw), recentAgents);
+}
+
 async function placePixelInRedis(
   redis: Redis,
   input: { x: number; y: number; color: AllowedColor; agentName: string }
@@ -498,15 +530,78 @@ async function placePixelInRedis(
   };
 }
 
+async function placePixelInRedisUrl(
+  redis: RedisUrlClient,
+  input: { x: number; y: number; color: AllowedColor; agentName: string }
+): Promise<PlacePixelResponse> {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const cooldownMs = COOLDOWN_SECONDS * 1000;
+  const cooldownKey = `${REDIS_KEYS.cooldowns}:${input.agentName}`;
+  const cooldownSet = await redis.set(cooldownKey, String(now), {
+    EX: COOLDOWN_SECONDS,
+    NX: true
+  });
+
+  if (cooldownSet !== "OK") {
+    const lastPlacement = await redis.get(cooldownKey);
+    const retryAt =
+      typeof lastPlacement === "string" ? Number(lastPlacement) + cooldownMs : now + cooldownMs;
+    throw new HttpError(429, `Cooldown active. Try again after ${new Date(retryAt).toISOString()}.`);
+  }
+
+  const index = pixelIndex(input.x, input.y);
+  const pixelField = String(index);
+  const fieldsAdded = await redis.hSet(REDIS_KEYS.pixels, pixelField, input.color);
+
+  const placement: PlacementRecord = {
+    agentName: input.agentName,
+    x: input.x,
+    y: input.y,
+    color: input.color,
+    placedAt: nowIso
+  };
+
+  await Promise.all([
+    redis.lPush(REDIS_KEYS.recentAgents, JSON.stringify(placement)),
+    redis.lTrim(REDIS_KEYS.recentAgents, 0, RECENT_AGENT_LIMIT - 1),
+    redis.hSet(REDIS_KEYS.meta, "updatedAt", nowIso),
+    fieldsAdded > 0 ? redis.hIncrBy(REDIS_KEYS.meta, "pixelCount", 1) : Promise.resolve(0)
+  ]);
+
+  const metaRaw = await redis.hGetAll(REDIS_KEYS.meta);
+  const meta = parseMeta(metaRaw);
+
+  return {
+    ok: true,
+    pixel: {
+      x: input.x,
+      y: input.y,
+      index,
+      color: input.color
+    },
+    nextAvailableAt: new Date(now + cooldownMs).toISOString(),
+    state: {
+      pixelCount: meta.pixelCount,
+      updatedAt: nowIso
+    }
+  };
+}
+
 export async function getBoardState(): Promise<BoardStateResponse> {
-  const artifactUrl = getArtifactRunUrl();
-  if (artifactUrl) {
-    return getStateFromArtifactStore();
+  const redisUrlClient = await getRedisUrlClient();
+  if (redisUrlClient) {
+    return getStateFromRedisUrl(redisUrlClient);
   }
 
   const redis = getRedisClient();
   if (redis) {
     return getStateFromRedis(redis);
+  }
+
+  const artifactUrl = getArtifactRunUrl();
+  if (artifactUrl) {
+    return getStateFromArtifactStore();
   }
 
   return getStateFromMemory();
@@ -518,14 +613,19 @@ export async function placePixel(input: {
   color: AllowedColor;
   agentName: string;
 }): Promise<PlacePixelResponse> {
-  const artifactUrl = getArtifactRunUrl();
-  if (artifactUrl) {
-    return placePixelInArtifactStore(input);
+  const redisUrlClient = await getRedisUrlClient();
+  if (redisUrlClient) {
+    return placePixelInRedisUrl(redisUrlClient, input);
   }
 
   const redis = getRedisClient();
   if (redis) {
     return placePixelInRedis(redis, input);
+  }
+
+  const artifactUrl = getArtifactRunUrl();
+  if (artifactUrl) {
+    return placePixelInArtifactStore(input);
   }
 
   return placePixelInMemory(input);

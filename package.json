@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
+    "redis": "^5.8.2",
     "@upstash/redis": "^1.35.3",
     "@vercel/node": "^5.1.16"
   },
