@@ -1,0 +1,31 @@
+{
+  "name": "z-place-zam",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "dev:worker": "wrangler dev",
+    "dev:railway": "tsx watch server.ts",
+    "build": "tsc --noEmit",
+    "start": "tsx server.ts",
+    "test": "node --test --import tsx",
+    "deploy:worker": "wrangler deploy"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "@upstash/redis": "^1.35.3",
+    "@vercel/node": "^5.1.16"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260312.1",
+    "@types/node": "^22.13.14",
+    "@types/express": "^5.0.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.72.0"
+  }
+}
