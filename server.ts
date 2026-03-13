@@ -197,6 +197,7 @@ function serviceContract(origin: string) {
 }
 
 const app = express();
+app.set("trust proxy", true);
 
 app.use(express.json({ limit: "1mb" }));
 app.use((_, response, next) => {
